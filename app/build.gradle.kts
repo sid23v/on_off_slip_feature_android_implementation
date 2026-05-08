@@ -42,5 +42,7 @@ dependencies {
 
     // UVC (USB endoscopy/webcam) library
     implementation("org.uvccamera:lib:0.0.13")
-}
 
+    // OpenCV (for trial_32.py port)
+    implementation("org.opencv:opencv:4.13.0")
+}

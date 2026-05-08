@@ -15,12 +15,18 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.content.PermissionChecker
+import com.serenegiant.usb.IFrameCallback
 import com.serenegiant.usb.USBMonitor
 import com.serenegiant.usb.USBMonitor.UsbControlBlock
 import com.serenegiant.usb.UVCCamera
+import java.nio.ByteBuffer
+import org.opencv.android.OpenCVLoader
+import org.opencv.core.CvType
+import org.opencv.core.Mat
 
 class MainActivity : AppCompatActivity() {
     private val sync = Any()
+    private val trackerLock = Any()
 
     private lateinit var usbMonitor: USBMonitor
     private var uvcCamera: UVCCamera? = null
@@ -33,15 +39,26 @@ class MainActivity : AppCompatActivity() {
     private var isPreview = false
 
     private lateinit var surfaceView: SurfaceView
+    private lateinit var overlayView: TrackingOverlayView
+    private lateinit var barsView: TrackingBarsView
     private lateinit var statusText: TextView
-    private lateinit var retryButton: Button
-    private lateinit var disconnectButton: Button
+    private lateinit var setReferenceButton: Button
+    private lateinit var resetButton: Button
+    private lateinit var quitButton: Button
+
+    private var openCvOk = false
+    private var tracker: Trial32Tracker? = null
+
+    private var previewWidth = UVCCamera.DEFAULT_PREVIEW_WIDTH
+    private var previewHeight = UVCCamera.DEFAULT_PREVIEW_HEIGHT
+
+    private var yPlane: ByteArray = ByteArray(0)
+    private var grayRawMat: Mat? = null
 
     private val requestCameraPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             if (granted) {
                 setStatus("Camera permission granted. Plug in the USB camera.")
-                // If the app was launched by USB attach intent, try to request USB permission now.
                 val requestedFromIntent = maybeRequestUsbPermissionFromIntent(intent)
                 if (!requestedFromIntent) {
                     requestUsbPermissionForFirstDevice()
@@ -55,10 +72,22 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        openCvOk = OpenCVLoader.initDebug()
+        if (openCvOk) {
+            tracker = Trial32Tracker()
+        }
+
         surfaceView = findViewById(R.id.camera_surface_view)
+        overlayView = findViewById(R.id.tracking_overlay)
+        barsView = findViewById(R.id.tracking_bars)
         statusText = findViewById(R.id.status_text)
-        retryButton = findViewById(R.id.retry_button)
-        disconnectButton = findViewById(R.id.disconnect_button)
+        setReferenceButton = findViewById(R.id.set_reference_button)
+        resetButton = findViewById(R.id.reset_button)
+        quitButton = findViewById(R.id.quit_button)
+
+        if (!openCvOk) {
+            setStatus("OpenCV failed to initialize. Tracking will not work.")
+        }
 
         surfaceView.holder.addCallback(surfaceCallback)
 
@@ -67,18 +96,40 @@ class MainActivity : AppCompatActivity() {
 
         usbMonitor = USBMonitor(this, deviceConnectListener)
 
-        retryButton.setOnClickListener {
-            if (!ensureCameraPermission()) return@setOnClickListener
-            requestUsbPermissionForFirstDevice()
+        setReferenceButton.setOnClickListener {
+            val t = tracker ?: run {
+                setStatus("OpenCV not available.")
+                return@setOnClickListener
+            }
+            if (t.getLastGrayForReference().empty()) {
+                setStatus("Waiting for camera frames...")
+                return@setOnClickListener
+            }
+            synchronized(trackerLock) {
+                t.setReferenceFromLastFrame()
+            }
+            t.last_status_message?.let { setStatus(it) }
         }
 
-        disconnectButton.setOnClickListener {
+        resetButton.setOnClickListener {
+            val t = tracker ?: return@setOnClickListener
+            synchronized(trackerLock) {
+                t.resetTrackingManual()
+            }
+            t.last_status_message?.let { setStatus(it) }
+        }
+
+        quitButton.setOnClickListener {
             closeCamera()
+            finishAndRemoveTask()
         }
 
         if (ensureCameraPermission()) {
             setStatus("Ready. Plug in the USB camera (OTG).")
-            maybeRequestUsbPermissionFromIntent(intent)
+            val requestedFromIntent = maybeRequestUsbPermissionFromIntent(intent)
+            if (!requestedFromIntent) {
+                requestUsbPermissionForFirstDevice()
+            }
         }
     }
 
@@ -109,6 +160,10 @@ class MainActivity : AppCompatActivity() {
             usbMonitor.destroy()
         }
         cameraThread.quitSafely()
+
+        grayRawMat?.release()
+        grayRawMat = null
+
         super.onDestroy()
     }
 
@@ -116,7 +171,7 @@ class MainActivity : AppCompatActivity() {
         val granted = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
             PermissionChecker.PERMISSION_GRANTED
         if (!granted) {
-            setStatus("Requesting camera permission…")
+            setStatus("Requesting camera permission...")
             requestCameraPermission.launch(Manifest.permission.CAMERA)
         }
         return granted
@@ -127,7 +182,7 @@ class MainActivity : AppCompatActivity() {
         val device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE) as? UsbDevice
         if (device != null) {
             if (!ensureCameraPermission()) return false
-            setStatus("USB device attached. Requesting permission…")
+            setStatus("USB device attached. Requesting permission...")
             usbMonitor.requestPermission(device)
             return true
         }
@@ -140,7 +195,7 @@ class MainActivity : AppCompatActivity() {
             setStatus("No USB devices found. Make sure OTG is enabled and the camera is connected.")
             return
         }
-        setStatus("Requesting permission for USB device…")
+        setStatus("Requesting permission for USB device...")
         usbMonitor.requestPermission(devices.first())
     }
 
@@ -154,10 +209,10 @@ class MainActivity : AppCompatActivity() {
         if (device == null) return
 
         if (count == 1) {
-            setStatus("USB camera detected. Requesting permission…")
+            setStatus("USB camera detected. Requesting permission...")
             usbMonitor.requestPermission(device)
         } else {
-            setStatus("Multiple USB devices detected. Tap Retry and unplug extra devices if needed.")
+            setStatus("Multiple USB devices detected. Unplug extra devices if needed.")
         }
     }
 
@@ -178,19 +233,40 @@ class MainActivity : AppCompatActivity() {
             val camera = UVCCamera()
             try {
                 camera.open(ctrlBlock)
+
                 try {
+                    // Mirror trial_32.py (960x720) as closely as the camera supports.
+                    previewWidth = Trial32Tracker.FRAME_WIDTH
+                    previewHeight = Trial32Tracker.FRAME_HEIGHT
                     camera.setPreviewSize(
-                        UVCCamera.DEFAULT_PREVIEW_WIDTH,
-                        UVCCamera.DEFAULT_PREVIEW_HEIGHT,
+                        previewWidth,
+                        previewHeight,
                         UVCCamera.FRAME_FORMAT_MJPEG,
                     )
                 } catch (_: IllegalArgumentException) {
-                    // Fallback to the library default mode (usually YUV)
-                    camera.setPreviewSize(
-                        UVCCamera.DEFAULT_PREVIEW_WIDTH,
-                        UVCCamera.DEFAULT_PREVIEW_HEIGHT,
-                        UVCCamera.DEFAULT_PREVIEW_MODE,
-                    )
+                    try {
+                        camera.setPreviewSize(
+                            previewWidth,
+                            previewHeight,
+                            UVCCamera.DEFAULT_PREVIEW_MODE,
+                        )
+                    } catch (_: IllegalArgumentException) {
+                        previewWidth = UVCCamera.DEFAULT_PREVIEW_WIDTH
+                        previewHeight = UVCCamera.DEFAULT_PREVIEW_HEIGHT
+                        try {
+                            camera.setPreviewSize(
+                                previewWidth,
+                                previewHeight,
+                                UVCCamera.FRAME_FORMAT_MJPEG,
+                            )
+                        } catch (_: IllegalArgumentException) {
+                            camera.setPreviewSize(
+                                previewWidth,
+                                previewHeight,
+                                UVCCamera.DEFAULT_PREVIEW_MODE,
+                            )
+                        }
+                    }
                 }
 
                 synchronized(sync) {
@@ -202,13 +278,14 @@ class MainActivity : AppCompatActivity() {
                 val surface = previewSurface
                 if (surface != null) {
                     camera.setPreviewDisplay(surface)
+                    camera.setFrameCallback(frameCallback, UVCCamera.PIXEL_FORMAT_NV21)
                     camera.startPreview()
                     synchronized(sync) {
                         isPreview = true
                     }
-                    runOnUiThread { setStatus("Preview started.") }
+                    runOnUiThread { setStatus("Preview started. Tap Set reference to start tracking.") }
                 } else {
-                    runOnUiThread { setStatus("Camera opened. Waiting for preview surface…") }
+                    runOnUiThread { setStatus("Camera opened. Waiting for preview surface...") }
                 }
             } catch (t: Throwable) {
                 try {
@@ -228,6 +305,10 @@ class MainActivity : AppCompatActivity() {
                 isActive = false
                 isPreview = false
                 try {
+                    camera?.setFrameCallback(null, 0)
+                } catch (_: Throwable) {
+                }
+                try {
                     camera?.stopPreview()
                 } catch (_: Throwable) {
                 }
@@ -236,7 +317,11 @@ class MainActivity : AppCompatActivity() {
                 } catch (_: Throwable) {
                 }
             }
-            runOnUiThread { setStatus("Camera disconnected.") }
+            runOnUiThread {
+                setStatus("Camera disconnected.")
+                overlayView.setFrameState(null)
+                barsView.setFrameState(null)
+            }
         }
     }
 
@@ -250,7 +335,7 @@ class MainActivity : AppCompatActivity() {
 
         override fun onConnect(device: UsbDevice?, ctrlBlock: UsbControlBlock?, createNew: Boolean) {
             if (ctrlBlock == null) return
-            runOnUiThread { setStatus("USB permission granted. Opening camera…") }
+            runOnUiThread { setStatus("USB permission granted. Opening camera...") }
             openCamera(ctrlBlock)
         }
 
@@ -263,7 +348,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         override fun onCancel(device: UsbDevice?) {
-            runOnUiThread { setStatus("USB permission denied. Tap Retry to request again.") }
+            runOnUiThread { setStatus("USB permission denied. Unplug/replug and try again.") }
         }
     }
 
@@ -280,6 +365,7 @@ class MainActivity : AppCompatActivity() {
                 if (isActive && !isPreview && uvcCamera != null && previewSurface != null) {
                     try {
                         uvcCamera?.setPreviewDisplay(previewSurface)
+                        uvcCamera?.setFrameCallback(frameCallback, UVCCamera.PIXEL_FORMAT_NV21)
                         uvcCamera?.startPreview()
                         isPreview = true
                     } catch (_: Throwable) {
@@ -292,6 +378,10 @@ class MainActivity : AppCompatActivity() {
             previewSurface = null
             synchronized(sync) {
                 try {
+                    uvcCamera?.setFrameCallback(null, 0)
+                } catch (_: Throwable) {
+                }
+                try {
                     uvcCamera?.stopPreview()
                 } catch (_: Throwable) {
                 }
@@ -302,5 +392,46 @@ class MainActivity : AppCompatActivity() {
 
     private fun setStatus(message: String) {
         statusText.text = message
+    }
+
+    private val frameCallback = IFrameCallback { frame: ByteBuffer ->
+        val t = tracker ?: return@IFrameCallback
+        if (!openCvOk) return@IFrameCallback
+
+        val w = previewWidth
+        val h = previewHeight
+        if (w <= 0 || h <= 0) return@IFrameCallback
+
+        val ySize = w * h
+        if (ySize <= 0) return@IFrameCallback
+
+        frame.clear()
+        if (frame.remaining() < ySize) return@IFrameCallback
+
+        if (yPlane.size != ySize) {
+            yPlane = ByteArray(ySize)
+        }
+        frame.get(yPlane, 0, ySize)
+
+        val grayRaw = grayRawMat?.let { existing ->
+            if (existing.rows() == h && existing.cols() == w && existing.type() == CvType.CV_8UC1) {
+                existing
+            } else {
+                existing.release()
+                Mat(h, w, CvType.CV_8UC1).also { grayRawMat = it }
+            }
+        } ?: Mat(h, w, CvType.CV_8UC1).also { grayRawMat = it }
+
+        grayRaw.put(0, 0, yPlane)
+
+        val state = synchronized(trackerLock) {
+            t.process(grayRaw)
+        }
+
+        runOnUiThread {
+            overlayView.setFrameState(state)
+            barsView.setFrameState(state)
+            state.status_message?.let { statusText.text = it }
+        }
     }
 }

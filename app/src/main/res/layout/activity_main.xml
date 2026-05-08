@@ -1,17 +1,31 @@
 <?xml version="1.0" encoding="utf-8"?>
-<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
-    android:layout_height="match_parent">
+    android:layout_height="match_parent"
+    android:keepScreenOn="true"
+    android:orientation="vertical">
 
-    <SurfaceView
-        android:id="@+id/camera_surface_view"
+    <FrameLayout
+        android:id="@+id/preview_container"
         android:layout_width="match_parent"
-        android:layout_height="match_parent" />
+        android:layout_height="0dp"
+        android:layout_weight="1">
+
+        <SurfaceView
+            android:id="@+id/camera_surface_view"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent" />
+
+        <com.example.uvcviewer.TrackingOverlayView
+            android:id="@+id/tracking_overlay"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent" />
+    </FrameLayout>
 
     <LinearLayout
+        android:id="@+id/control_panel"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_gravity="bottom"
         android:background="#99000000"
         android:orientation="vertical"
         android:padding="12dp">
@@ -24,28 +38,41 @@
             android:textColor="@android:color/white"
             android:textSize="14sp" />
 
+        <com.example.uvcviewer.TrackingBarsView
+            android:id="@+id/tracking_bars"
+            android:layout_width="match_parent"
+            android:layout_height="140dp"
+            android:layout_marginTop="10dp" />
+
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
+            android:layout_marginTop="10dp"
             android:orientation="horizontal">
 
             <Button
-                android:id="@+id/retry_button"
+                android:id="@+id/set_reference_button"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:text="@string/retry" />
+                android:text="@string/set_reference" />
 
             <Button
-                android:id="@+id/disconnect_button"
+                android:id="@+id/reset_button"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_marginStart="8dp"
                 android:layout_weight="1"
-                android:text="@string/disconnect" />
+                android:text="@string/reset" />
+
+            <Button
+                android:id="@+id/quit_button"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:layout_weight="1"
+                android:text="@string/quit" />
         </LinearLayout>
     </LinearLayout>
 
-</FrameLayout>
-
+</LinearLayout>
