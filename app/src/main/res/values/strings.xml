@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">UVC Viewer</string>
+    <string name="status_initial">Initializing…</string>
+    <string name="retry">Retry</string>
+    <string name="disconnect">Disconnect</string>
+</resources>
+
