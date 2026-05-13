@@ -10,6 +10,8 @@ import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.widget.Button
+import android.widget.FrameLayout
+import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -71,6 +73,17 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+
+        // Adjust preview container to maintain 960x720 aspect ratio
+        val displayMetrics = resources.displayMetrics
+        val screenWidth = displayMetrics.widthPixels
+        val aspectRatio = 720.0 / 960.0
+        val desiredHeight = (screenWidth * aspectRatio).toInt()
+        val previewContainer = findViewById<FrameLayout>(R.id.preview_container)
+        val params = previewContainer.layoutParams as LinearLayout.LayoutParams
+        params.height = desiredHeight
+        params.weight = 0f
+        previewContainer.layoutParams = params
 
         openCvOk = OpenCVLoader.initDebug()
         if (openCvOk) {
