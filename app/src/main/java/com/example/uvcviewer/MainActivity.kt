@@ -1,11 +1,14 @@
 package com.example.uvcviewer
 
 import android.Manifest
+import android.app.ActivityManager
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Looper
+import android.text.format.Formatter
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -21,7 +24,9 @@ import com.serenegiant.usb.IFrameCallback
 import com.serenegiant.usb.USBMonitor
 import com.serenegiant.usb.USBMonitor.UsbControlBlock
 import com.serenegiant.usb.UVCCamera
+import java.io.RandomAccessFile
 import java.nio.ByteBuffer
+import java.util.Locale
 import org.opencv.android.OpenCVLoader
 import org.opencv.core.CvType
 import org.opencv.core.Mat
@@ -47,9 +52,20 @@ class MainActivity : AppCompatActivity() {
     private lateinit var setReferenceButton: Button
     private lateinit var resetButton: Button
     private lateinit var quitButton: Button
+    private lateinit var performanceText: TextView
 
     private var openCvOk = false
     private var tracker: Trial32Tracker? = null
+
+    private val perfHandler = Handler(Looper.getMainLooper())
+    private var lastCpuStatTotal = 0L
+    private var lastCpuStatIdle = 0L
+    private val perfUpdateRunnable = object : Runnable {
+        override fun run() {
+            updatePerformanceMetrics()
+            perfHandler.postDelayed(this, 1000)
+        }
+    }
 
     private var previewWidth = UVCCamera.DEFAULT_PREVIEW_WIDTH
     private var previewHeight = UVCCamera.DEFAULT_PREVIEW_HEIGHT
@@ -94,6 +110,7 @@ class MainActivity : AppCompatActivity() {
         overlayView = findViewById(R.id.tracking_overlay)
         barsView = findViewById(R.id.tracking_bars)
         statusText = findViewById(R.id.status_text)
+        performanceText = findViewById(R.id.performance_text)
         setReferenceButton = findViewById(R.id.set_reference_button)
         resetButton = findViewById(R.id.reset_button)
         quitButton = findViewById(R.id.quit_button)
@@ -157,9 +174,11 @@ class MainActivity : AppCompatActivity() {
         synchronized(sync) {
             usbMonitor.register()
         }
+        perfHandler.post(perfUpdateRunnable)
     }
 
     override fun onStop() {
+        perfHandler.removeCallbacks(perfUpdateRunnable)
         closeCamera()
         synchronized(sync) {
             usbMonitor.unregister()
@@ -405,6 +424,77 @@ class MainActivity : AppCompatActivity() {
 
     private fun setStatus(message: String) {
         statusText.text = message
+    }
+
+    private fun updatePerformanceMetrics() {
+        val activityManager = getSystemService(ACTIVITY_SERVICE) as ActivityManager
+        val memoryInfo = ActivityManager.MemoryInfo().apply {
+            activityManager.getMemoryInfo(this)
+        }
+
+        val totalRam = memoryInfo.totalMem
+        val availRam = memoryInfo.availMem
+        val usedRam = totalRam - availRam
+        val memoryPercent = if (totalRam > 0) usedRam * 100.0 / totalRam else 0.0
+        val lowMemoryState = if (memoryInfo.lowMemory) "YES" else "NO"
+
+        val runtime = Runtime.getRuntime()
+        val appUsedRam = runtime.totalMemory() - runtime.freeMemory()
+        val appMaxRam = runtime.maxMemory()
+
+        val cpuUsage = readCpuUsagePercent()
+        val cpuText = if (cpuUsage == null) {
+            "calculating..."
+        } else {
+            String.format(Locale.US, "%.1f%%", cpuUsage)
+        }
+
+        performanceText.text = buildString {
+            append("RAM total: ${formatBytes(totalRam)}\n")
+            append("RAM used: ${formatBytes(usedRam)} (${String.format(Locale.US, "%.1f%%", memoryPercent)})\n")
+            append("RAM available: ${formatBytes(availRam)}\n")
+            append("Low memory threshold: ${formatBytes(memoryInfo.threshold)}\n")
+            append("Low memory: $lowMemoryState\n")
+            append("App memory: ${formatBytes(appUsedRam)} / ${formatBytes(appMaxRam)}\n")
+            append("CPU usage: $cpuText")
+        }
+    }
+
+    private fun formatBytes(bytes: Long): String {
+        return Formatter.formatFileSize(this, bytes)
+    }
+
+    private fun readCpuUsagePercent(): Double? {
+        return try {
+            RandomAccessFile("/proc/stat", "r").use { reader ->
+                val line = reader.readLine() ?: return null
+                val parts = line.trim().split("\\s+")
+                if (parts.size < 5 || parts[0] != "cpu") return null
+
+                val user = parts[1].toLongOrNull() ?: 0L
+                val nice = parts[2].toLongOrNull() ?: 0L
+                val system = parts[3].toLongOrNull() ?: 0L
+                val idle = parts[4].toLongOrNull() ?: 0L
+                val iowait = parts.getOrNull(5)?.toLongOrNull() ?: 0L
+                val irq = parts.getOrNull(6)?.toLongOrNull() ?: 0L
+                val softIrq = parts.getOrNull(7)?.toLongOrNull() ?: 0L
+
+                val total = user + nice + system + idle + iowait + irq + softIrq
+                val usage = if (lastCpuStatTotal <= 0L) {
+                    null
+                } else {
+                    val totalDiff = total - lastCpuStatTotal
+                    val idleDiff = idle - lastCpuStatIdle
+                    if (totalDiff <= 0L) null else (100.0 * (totalDiff - idleDiff) / totalDiff)
+                }
+
+                lastCpuStatTotal = total
+                lastCpuStatIdle = idle
+                usage
+            }
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private val frameCallback = IFrameCallback { frame: ByteBuffer ->
