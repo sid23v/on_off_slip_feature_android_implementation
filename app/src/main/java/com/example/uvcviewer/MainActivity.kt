@@ -24,6 +24,7 @@ import com.serenegiant.usb.IFrameCallback
 import com.serenegiant.usb.USBMonitor
 import com.serenegiant.usb.USBMonitor.UsbControlBlock
 import com.serenegiant.usb.UVCCamera
+import java.io.File
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.util.Locale
@@ -58,8 +59,6 @@ class MainActivity : AppCompatActivity() {
     private var tracker: Trial32Tracker? = null
 
     private val perfHandler = Handler(Looper.getMainLooper())
-    private var lastCpuStatTotal = 0L
-    private var lastCpuStatIdle = 0L
     private val perfUpdateRunnable = object : Runnable {
         override fun run() {
             updatePerformanceMetrics()
@@ -442,12 +441,10 @@ class MainActivity : AppCompatActivity() {
         val appUsedRam = runtime.totalMemory() - runtime.freeMemory()
         val appMaxRam = runtime.maxMemory()
 
-        val cpuUsage = readCpuUsagePercent()
-        val cpuText = if (cpuUsage == null) {
-            "calculating..."
-        } else {
-            String.format(Locale.US, "%.1f%%", cpuUsage)
-        }
+        // Get app's actual process memory (PSS)
+        val pssKb = activityManager.getProcessMemoryInfo(intArrayOf(android.os.Process.myPid()))[0].totalPss
+        val appPidMemory = pssKb * 1024L
+        val appRamPercent = if (totalRam > 0) appPidMemory * 100.0 / totalRam else 0.0
 
         performanceText.text = buildString {
             append("RAM total: ${formatBytes(totalRam)}\n")
@@ -455,46 +452,13 @@ class MainActivity : AppCompatActivity() {
             append("RAM available: ${formatBytes(availRam)}\n")
             append("Low memory threshold: ${formatBytes(memoryInfo.threshold)}\n")
             append("Low memory: $lowMemoryState\n")
-            append("App memory: ${formatBytes(appUsedRam)} / ${formatBytes(appMaxRam)}\n")
-            append("CPU usage: $cpuText")
+            append("App memory (heap): ${formatBytes(appUsedRam)} / ${formatBytes(appMaxRam)}\n")
+            append("App RAM of total: ${formatBytes(appPidMemory)} (${String.format(Locale.US, "%.1f%%", appRamPercent)})")
         }
     }
 
     private fun formatBytes(bytes: Long): String {
         return Formatter.formatFileSize(this, bytes)
-    }
-
-    private fun readCpuUsagePercent(): Double? {
-        return try {
-            RandomAccessFile("/proc/stat", "r").use { reader ->
-                val line = reader.readLine() ?: return null
-                val parts = line.trim().split("\\s+")
-                if (parts.size < 5 || parts[0] != "cpu") return null
-
-                val user = parts[1].toLongOrNull() ?: 0L
-                val nice = parts[2].toLongOrNull() ?: 0L
-                val system = parts[3].toLongOrNull() ?: 0L
-                val idle = parts[4].toLongOrNull() ?: 0L
-                val iowait = parts.getOrNull(5)?.toLongOrNull() ?: 0L
-                val irq = parts.getOrNull(6)?.toLongOrNull() ?: 0L
-                val softIrq = parts.getOrNull(7)?.toLongOrNull() ?: 0L
-
-                val total = user + nice + system + idle + iowait + irq + softIrq
-                val usage = if (lastCpuStatTotal <= 0L) {
-                    null
-                } else {
-                    val totalDiff = total - lastCpuStatTotal
-                    val idleDiff = idle - lastCpuStatIdle
-                    if (totalDiff <= 0L) null else (100.0 * (totalDiff - idleDiff) / totalDiff)
-                }
-
-                lastCpuStatTotal = total
-                lastCpuStatIdle = idle
-                usage
-            }
-        } catch (_: Exception) {
-            null
-        }
     }
 
     private val frameCallback = IFrameCallback { frame: ByteBuffer ->
