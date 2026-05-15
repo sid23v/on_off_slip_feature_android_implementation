@@ -59,6 +59,13 @@ class MainActivity : AppCompatActivity() {
     private var tracker: Trial32Tracker? = null
 
     private val perfHandler = Handler(Looper.getMainLooper())
+    private var lastCpuStatTotal = 0L
+    private var lastCpuStatIdle = 0L
+    private var lastAppCpuTime = android.os.Process.getElapsedCpuTime()
+    private var lastWallTime = System.currentTimeMillis()
+    private var frameCount = 0
+    private var lastFpsTime = System.currentTimeMillis()
+    private var currentFps = 0.0
     private val perfUpdateRunnable = object : Runnable {
         override fun run() {
             updatePerformanceMetrics()
@@ -446,6 +453,9 @@ class MainActivity : AppCompatActivity() {
         val appPidMemory = pssKb * 1024L
         val appRamPercent = if (totalRam > 0) appPidMemory * 100.0 / totalRam else 0.0
 
+        val cpuUsage = readCpuUsagePercent()
+        val appCpuUsage = readAppCpuUsagePercent()
+
         performanceText.text = buildString {
             append("RAM total: ${formatBytes(totalRam)}\n")
             append("RAM used: ${formatBytes(usedRam)} (${String.format(Locale.US, "%.1f%%", memoryPercent)})\n")
@@ -453,7 +463,11 @@ class MainActivity : AppCompatActivity() {
             append("Low memory threshold: ${formatBytes(memoryInfo.threshold)}\n")
             append("Low memory: $lowMemoryState\n")
             append("App memory (heap): ${formatBytes(appUsedRam)} / ${formatBytes(appMaxRam)}\n")
-            append("App RAM of total: ${formatBytes(appPidMemory)} (${String.format(Locale.US, "%.1f%%", appRamPercent)})")
+            append("App RAM of total: ${formatBytes(appPidMemory)} (${String.format(Locale.US, "%.1f%%", appRamPercent)})\n")
+            append("FPS (processed): ${String.format(Locale.US, "%.1f", currentFps)}\n")
+            append("CPU load: ${String.format(Locale.US, "%.1f%%", cpuUsage)}\n")
+            append("App CPU contribution: ${String.format(Locale.US, "%.1f%%", appCpuUsage)}\n")
+            append("GPU usage: N/A (not available via Android APIs)")
         }
     }
 
@@ -461,7 +475,71 @@ class MainActivity : AppCompatActivity() {
         return Formatter.formatFileSize(this, bytes)
     }
 
+    private fun readCpuUsagePercent(): Double {
+        return try {
+            val statFile = File("/proc/stat")
+            if (!statFile.exists()) return 0.0
+            val line = statFile.useLines { lines -> lines.firstOrNull() } ?: return 0.0
+            val parts = line.trim().split("\\s+".toRegex())
+            if (parts.size < 5 || parts[0] != "cpu") return 0.0
+
+            val user = parts[1].toLongOrNull() ?: 0L
+            val nice = parts[2].toLongOrNull() ?: 0L
+            val system = parts[3].toLongOrNull() ?: 0L
+            val idle = parts[4].toLongOrNull() ?: 0L
+            val iowait = parts.getOrNull(5)?.toLongOrNull() ?: 0L
+            val irq = parts.getOrNull(6)?.toLongOrNull() ?: 0L
+            val softIrq = parts.getOrNull(7)?.toLongOrNull() ?: 0L
+
+            val total = user + nice + system + idle + iowait + irq + softIrq
+            val usage = if (lastCpuStatTotal <= 0L) {
+                0.0
+            } else {
+                val totalDiff = total - lastCpuStatTotal
+                val idleDiff = idle - lastCpuStatIdle
+                if (totalDiff <= 0L) 0.0 else (100.0 * (totalDiff - idleDiff) / totalDiff).coerceIn(0.0, 100.0)
+            }
+
+            lastCpuStatTotal = total
+            lastCpuStatIdle = idle
+            usage
+        } catch (_: Exception) {
+            0.0
+        }
+    }
+
+    private fun readAppCpuUsagePercent(): Double {
+        return try {
+            val currentAppCpuTime = android.os.Process.getElapsedCpuTime() // ms of CPU used by this process
+            val currentWall = System.currentTimeMillis()
+
+            val appCpuDiff = currentAppCpuTime - lastAppCpuTime
+            val wallDiff = currentWall - lastWallTime
+
+            lastAppCpuTime = currentAppCpuTime
+            lastWallTime = currentWall
+
+            if (wallDiff <= 0L || appCpuDiff <= 0L) return 0.0
+
+            val cores = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
+            // Percentage = (app cpu ms during interval) / (wall ms * cores) * 100
+            val pct = (appCpuDiff.toDouble() / (wallDiff.toDouble() * cores.toDouble())) * 100.0
+            pct.coerceIn(0.0, 100.0)
+        } catch (_: Exception) {
+            0.0
+        }
+    }
+
     private val frameCallback = IFrameCallback { frame: ByteBuffer ->
+        // Update FPS
+        frameCount++
+        val currentTime = System.currentTimeMillis()
+        if (currentTime - lastFpsTime >= 1000) {
+            currentFps = frameCount.toDouble()
+            frameCount = 0
+            lastFpsTime = currentTime
+        }
+
         val t = tracker ?: return@IFrameCallback
         if (!openCvOk) return@IFrameCallback
 
