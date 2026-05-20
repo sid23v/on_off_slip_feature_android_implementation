@@ -453,7 +453,6 @@ class MainActivity : AppCompatActivity() {
         val appPidMemory = pssKb * 1024L
         val appRamPercent = if (totalRam > 0) appPidMemory * 100.0 / totalRam else 0.0
 
-        val cpuUsage = readCpuUsagePercent()
         val appCpuUsage = readAppCpuUsagePercent()
 
         performanceText.text = buildString {
@@ -465,9 +464,7 @@ class MainActivity : AppCompatActivity() {
             append("App memory (heap): ${formatBytes(appUsedRam)} / ${formatBytes(appMaxRam)}\n")
             append("App RAM of total: ${formatBytes(appPidMemory)} (${String.format(Locale.US, "%.1f%%", appRamPercent)})\n")
             append("FPS (processed): ${String.format(Locale.US, "%.1f", currentFps)}\n")
-            append("CPU load: ${String.format(Locale.US, "%.1f%%", cpuUsage)}\n")
-            append("App CPU contribution: ${String.format(Locale.US, "%.1f%%", appCpuUsage)}\n")
-            append("GPU usage: N/A (not available via Android APIs)")
+            append("App CPU utilization: ${String.format(Locale.US, "%.1f%%", appCpuUsage)}")
         }
     }
 
@@ -477,6 +474,18 @@ class MainActivity : AppCompatActivity() {
 
     private fun readCpuUsagePercent(): Double {
         return try {
+            val loadAvgFile = File("/proc/loadavg")
+            if (loadAvgFile.exists()) {
+                val line = loadAvgFile.useLines { lines -> lines.firstOrNull() } ?: return 0.0
+                val parts = line.trim().split("\\s+".toRegex())
+                if (parts.isNotEmpty()) {
+                    val oneMinuteLoad = parts[0].toDoubleOrNull() ?: return 0.0
+                    val cores = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
+                    return (oneMinuteLoad / cores * 100.0).coerceIn(0.0, 100.0)
+                }
+            }
+
+            // Fallback for devices where /proc/loadavg is unavailable.
             val statFile = File("/proc/stat")
             if (!statFile.exists()) return 0.0
             val line = statFile.useLines { lines -> lines.firstOrNull() } ?: return 0.0

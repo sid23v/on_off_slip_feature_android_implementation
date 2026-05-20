@@ -64,43 +64,7 @@ public final class TrackingOverlayView extends View {
     @Override
     protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
-
-        if (ref_center == null) {
-            return;
-        }
-
-        float sx = (float) getWidth() / (float) Trial32Tracker.FRAME_WIDTH;
-        float sy = (float) getHeight() / (float) Trial32Tracker.FRAME_HEIGHT;
-
-        float refX = ref_center[0] * sx;
-        float refY = ref_center[1] * sy;
-
-        // ref marker: blue circle
-        paint.setColor(Color.rgb(0, 0, 255));
-        canvas.drawCircle(refX, refY, Trial32Tracker.MARKER_SIZE * Math.min(sx, sy), paint);
-
-        if (live_pt != null) {
-            float liveX = live_pt[0] * sx;
-            float liveY = live_pt[1] * sy;
-
-            // live marker: green circle
-            paint.setColor(Color.rgb(0, 255, 0));
-            canvas.drawCircle(liveX, liveY, Trial32Tracker.MARKER_SIZE * Math.min(sx, sy), paint);
-
-            // arrow (live -> ref center)
-            int arrowColor = getDistanceColor(distance);
-            paint.setColor(arrowColor);
-            paint.setStyle(Paint.Style.STROKE);
-            paint.setStrokeWidth(3f * Math.min(sx, sy));
-            canvas.drawLine(liveX, liveY, refX, refY, paint);
-
-            drawArrowHead(canvas, liveX, liveY, refX, refY, paint, 0.3f);
-            paint.setStyle(Paint.Style.FILL);
-        }
-
-        if (overlay_counter > 0) {
-            canvas.drawRect(0, 0, getWidth(), getHeight(), overlayPaint);
-        }
+        // Overlay rendering disabled: keep tracker state logic intact but do not draw markers/arrows.
     }
 
     private static int getDistanceColor(int distance) {
