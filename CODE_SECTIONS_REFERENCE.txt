@@ -1,0 +1,205 @@
+================================================================================
+CODE SECTIONS REFERENCE - on_off_slip_android_v3 Project
+================================================================================
+
+1. INPUT FRAME CAPTURE FROM ENDOSCOPY CAMERA
+================================================================================
+
+File: app/src/main/java/com/example/uvcviewer/MainActivity.kt
+Location: Lines 555-650 (frameCallback lambda)
+
+Description:
+  - Captures raw frame data from the UVC camera in NV21 format
+  - Extracts the Y plane (grayscale data) from the NV21 buffer
+  - Converts the byte array to OpenCV Mat format
+  - Implements alternate frame processing (every 2nd frame is tracked)
+  - Relays all frames to the UI overlay and performance updates
+
+Key Code Sections within frameCallback:
+  - Line 555-565: Frame callback initialization and FPS tracking
+  - Line 567-576: Input validation and buffer size checks
+  - Line 578-587: Extract Y plane from NV21 buffer and create Mat
+  - Line 589-600: Alternate frame processing (process every 2nd frame)
+  - Line 601-650: UI update with tracking state and auto-reset popup
+
+================================================================================
+
+2. COLOURED CIRCLE RENDERING
+================================================================================
+
+File: app/src/main/java/com/example/uvcviewer/TrackingBarsView.java
+Location: Lines 130-230 (complete onDraw method)
+
+Description:
+  - Replaces the previous radial/axial bars with a single status circle
+  - Implements AND logic combining radial distance and axial height colors
+  - Colors: Green (OK), Amber (warning), Red (critical), Grey (inactive)
+  - Circle persists RED during auto-reset state
+  - Uses semi-transparent grey when tracking is inactive
+
+Key Code Sections:
+  - Line 130-145: Initialize canvas and calculate circle dimensions
+  - Line 147-152: Compute axial display value with animation
+  - Line 154-165: Calculate radial severity (0=green, 1=amber, 2=red)
+  - Line 167-183: Calculate axial severity with scale ratio logic
+  - Line 185: Combined severity using Math.max(radial, axial)
+  - Line 187-190: Define color constants (green, amber, red, grey-transparent)
+  - Line 192-195: Calculate circle center and radius
+  - Line 197-212: Determine final fill color based on tracking state
+                  - Red if autoResetActive
+                  - Grey if tracking inactive
+                  - Combined color if tracking active
+  - Line 214-219: Draw filled circle and border
+  - Line 221-223: Schedule animation update if needed
+
+Color Logic (AND Logic):
+  - Green: radialSeverity=0 AND axialSeverity=0
+  - Amber: radialSeverity<=1 AND axialSeverity<=1 (at least one is 1)
+  - Red: radialSeverity=2 OR axialSeverity=2
+
+Auto-reset State:
+  - Line 202: Check autoResetActive flag (set from MainActivity)
+  - When true, circle is forced to RED regardless of severity
+
+================================================================================
+
+3. OUTPUT FRAME RENDERING
+================================================================================
+
+File: app/src/main/java/com/example/uvcviewer/MainActivity.kt
+
+Surface Initialization and Display:
+  Location: Lines 404-441 (surfaceCallback implementation)
+  
+  Description:
+    - Manages the SurfaceView lifecycle for camera preview output
+    - Sets up the preview display surface for the UVC camera
+    - Connects the frame callback to the camera
+    - Handles surface destruction and cleanup
+
+  Key Code Sections:
+    - Line 404-406: surfaceCreated (no-op)
+    - Line 408-427: surfaceChanged - Sets preview display and starts preview
+      * Line 415: Sets preview surface: camera?.setPreviewDisplay(previewSurface)
+      * Line 416: Registers frame callback for pixel capture
+      * Line 417: Starts preview rendering: camera?.startPreview()
+    - Line 429-441: surfaceDestroyed - Cleanup and preview stop
+
+Preview Container Setup:
+  Location: Lines 103-115 (onCreate method)
+  
+  Description:
+    - Configures the preview container to maintain 960x720 aspect ratio
+    - Adjusts layout parameters for proper display scaling
+    - Ensures output window maintains consistent dimensions
+
+  Key Code Sections:
+    - Line 103-108: Get display metrics and calculate desired height
+    - Line 109: Get preview container (FrameLayout with id preview_container)
+    - Line 110-114: Set layout parameters to maintain aspect ratio
+
+SurfaceView Reference:
+  Location: Line 120 (in onCreate)
+  - findViewById<SurfaceView>(R.id.camera_surface_view)
+  - Connected to surfaceCallback at Line 136
+
+UI Layer Rendering (Overlays):
+  Location: Lines 595-602 (UI updates in frameCallback)
+  
+  Description:
+    - Updates overlay and status circle after each frame relay
+    - Displays tracking state and performance metrics
+  
+  Key Code Sections:
+    - Line 595: overlayView.setFrameState(stateToRelay) - Update overlay
+    - Line 596: barsView.setFrameState(stateToRelay) - Update circle colors
+    - Line 597: Update status text with tracker messages
+
+Layout File Reference:
+  File: app/src/main/res/layout/activity_main.xml
+  - Contains: SurfaceView (id: camera_surface_view)
+  - Contains: FrameLayout (id: preview_container)
+  - Contains: TrackingOverlayView and TrackingBarsView overlays
+
+================================================================================
+
+4. AUTO-RESET POPUP MESSAGE RENDERING
+================================================================================
+
+File: app/src/main/java/com/example/uvcviewer/MainActivity.kt
+Location: Lines 610-641 (within frameCallback's runOnUiThread block)
+
+Description:
+  - Displays a non-cancellable AlertDialog popup when auto-reset is triggered
+  - Shows the auto-reset reason message to the user
+  - Automatically dismisses after 10 seconds OR when user clicks OK button
+  - Persists RED circle color while popup is displayed
+  - Dismisses immediately if user clicks "Set Reference" button
+
+Key Code Sections:
+  - Line 610-612: Detect auto-reset trigger by checking status message
+  - Line 613: Check if popup already displayed to avoid duplicates
+  - Line 614: Set barsView to RED state (autoResetActive = true)
+  - Line 615-620: Create AlertDialog.Builder with non-cancellable flag
+    * Line 616: Set title: "Auto-reset"
+    * Line 617: Set message: Display reason from tracker
+    * Line 618: setCancelable(false) - User cannot dismiss by tapping outside
+  - Line 619-624: OK button handler
+    * Dismisses dialog
+    * Clears RED circle state (autoResetActive = false)
+    * Cancels pending 10-second timeout if still pending
+  - Line 625-626: Create and show the dialog
+  - Line 628-632: Schedule 10-second auto-dismiss runnable
+    * Dismisses dialog after 10 seconds
+    * Clears RED circle state
+    * Cleans up dialog references
+
+Popup Behavior:
+  - Display: Shows when status_message contains "Auto-reset"
+  - Title: "Auto-reset"
+  - Message: Full reason from Trial32Tracker (e.g., "Auto-reset (low feature density / axial motion)")
+  - Button: Single "OK" button
+  - Timeout: 10 seconds (line 641: postDelayed with 10000L)
+  - Circle State: RED persists for entire duration (line 614 & 623)
+  - Integration: Set Reference button also dismisses (line 161-164)
+
+Set Reference Button Integration:
+  Location: Lines 146-165 (setReferenceButton.setOnClickListener)
+  
+  Description:
+    - Also handles dismissing active auto-reset popup
+  
+  Key Code Sections:
+    - Line 158: Dismiss any active dialog
+    - Line 159: Clear dialog reference
+    - Line 160-162: Cancel pending 10-second dismiss timeout
+    - Line 163: Clear RED circle state (autoResetActive = false)
+
+Handler and Runnable Management:
+  Location: Lines 72-73 (class-level fields)
+  
+  Description:
+    - autoResetHandler: Handler for scheduling 10-second dismissal
+    - autoResetDismissRunnable: Runnable that dismisses popup after timeout
+
+  Setup: Line 72-73 in MainActivity class
+  - autoResetDialog: AlertDialog reference (null when not shown)
+  - autoResetHandler: Main thread Handler for delayed tasks
+  - autoResetDismissRunnable: Runnable instance for the 10s timeout
+
+================================================================================
+FRAME PROCESSING PIPELINE SUMMARY
+================================================================================
+
+1. Camera Input → NV21 buffer (frameCallback, line 555)
+2. Y-plane extraction → OpenCV Mat (line 583)
+3. Alternate frame processing → Only every 2nd frame tracked (line 589-600)
+4. Tracking computation → Trial32Tracker.process() (line 599)
+5. UI update → overlayView + barsView (line 595-596)
+6. Circle color determined → Based on radial+axial AND logic (line 154-212)
+7. Auto-reset detection → If status contains "Auto-reset" (line 610)
+8. Popup display → Non-cancellable dialog for 10s (line 610-641)
+9. Red circle persistence → Maintained while popup active (line 614 & 623)
+10. Preview rendering → Direct to SurfaceView via camera preview (line 427)
+
+================================================================================
