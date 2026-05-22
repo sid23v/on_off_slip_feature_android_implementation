@@ -18,6 +18,7 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.app.AlertDialog
 import androidx.core.content.ContextCompat
 import androidx.core.content.PermissionChecker
 import com.serenegiant.usb.IFrameCallback
@@ -78,6 +79,10 @@ class MainActivity : AppCompatActivity() {
 
     private var yPlane: ByteArray = ByteArray(0)
     private var grayRawMat: Mat? = null
+    // Auto-reset dialog and state
+    private var autoResetDialog: AlertDialog? = null
+    private val autoResetHandler = Handler(Looper.getMainLooper())
+    private var autoResetDismissRunnable: Runnable? = null
 
     private val requestCameraPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -145,6 +150,12 @@ class MainActivity : AppCompatActivity() {
                 t.setReferenceFromLastFrame()
             }
             t.last_status_message?.let { setStatus(it) }
+            // If user sets reference while an auto-reset popup is active, dismiss it and clear red state.
+            autoResetDialog?.dismiss()
+            autoResetDialog = null
+            autoResetDismissRunnable?.let { autoResetHandler.removeCallbacks(it) }
+            autoResetDismissRunnable = null
+            barsView.setAutoResetActive(false)
         }
 
         resetButton.setOnClickListener {
@@ -463,7 +474,7 @@ class MainActivity : AppCompatActivity() {
             append("Low memory: $lowMemoryState\n")
             append("App memory (heap): ${formatBytes(appUsedRam)} / ${formatBytes(appMaxRam)}\n")
             append("App RAM of total: ${formatBytes(appPidMemory)} (${String.format(Locale.US, "%.1f%%", appRamPercent)})\n")
-            append("FPS (processed): ${String.format(Locale.US, "%.1f", currentFps)}\n")
+            append("FPS (output+processed): ${String.format(Locale.US, "%.1f", currentFps)}\n")
             append("App CPU utilization: ${String.format(Locale.US, "%.1f%%", appCpuUsage)}")
         }
     }
@@ -539,6 +550,8 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private var trackingFrameCounter = 0
+    private var lastTrackingState: Trial32Tracker.FrameState? = null
     private val frameCallback = IFrameCallback { frame: ByteBuffer ->
         // Update FPS
         frameCount++
@@ -578,14 +591,54 @@ class MainActivity : AppCompatActivity() {
 
         grayRaw.put(0, 0, yPlane)
 
-        val state = synchronized(trackerLock) {
-            t.process(grayRaw)
+        // Relay every frame, but only process every alternate frame for tracking
+        trackingFrameCounter = (trackingFrameCounter + 1) % 2
+        if (trackingFrameCounter == 0) {
+            val state = synchronized(trackerLock) {
+                t.process(grayRaw)
+            }
+            lastTrackingState = state
         }
+        // Always relay the last tracking state (may be from previous frame)
+        val stateToRelay = lastTrackingState
+        if (stateToRelay != null) {
+            runOnUiThread {
+                overlayView.setFrameState(stateToRelay)
+                barsView.setFrameState(stateToRelay)
+                stateToRelay.status_message?.let { statusText.text = it }
 
-        runOnUiThread {
-            overlayView.setFrameState(state)
-            barsView.setFrameState(state)
-            state.status_message?.let { statusText.text = it }
+                // If auto-reset triggered, show a non-cancellable popup for 10s or until Set Reference is clicked.
+                val msg = stateToRelay.status_message
+                if (msg != null && msg.contains("Auto-reset")) {
+                    // show dialog if not already shown
+                    if (autoResetDialog == null) {
+                        barsView.setAutoResetActive(true)
+                        val builder = AlertDialog.Builder(this@MainActivity)
+                        builder.setTitle("Auto-reset")
+                        builder.setMessage(msg)
+                        builder.setCancelable(false)
+                        builder.setPositiveButton("OK") { dlg, _ ->
+                            dlg.dismiss()
+                            barsView.setAutoResetActive(false)
+                            autoResetDialog = null
+                            autoResetDismissRunnable?.let { autoResetHandler.removeCallbacks(it) }
+                            autoResetDismissRunnable = null
+                        }
+                        val dlg = builder.create()
+                        autoResetDialog = dlg
+                        dlg.show()
+
+                        // Dismiss after 10s if still present
+                        autoResetDismissRunnable = Runnable {
+                            autoResetDialog?.dismiss()
+                            autoResetDialog = null
+                            barsView.setAutoResetActive(false)
+                            autoResetDismissRunnable = null
+                        }
+                        autoResetHandler.postDelayed(autoResetDismissRunnable!!, 10000L)
+                    }
+                }
+            }
         }
     }
 }

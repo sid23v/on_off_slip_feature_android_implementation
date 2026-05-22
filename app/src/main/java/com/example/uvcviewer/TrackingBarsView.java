@@ -32,6 +32,7 @@ public final class TrackingBarsView extends View {
     private final Paint centerLinePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
 
     private final RectF barRect = new RectF();
+    private boolean autoResetActive = false;
 
     private int distance = 0;
 
@@ -81,6 +82,11 @@ public final class TrackingBarsView extends View {
             distance = state.distance;
             setTargetScale(state.last_scale_est, false);
         }
+        postInvalidateOnAnimation();
+    }
+
+    public void setAutoResetActive(boolean v) {
+        autoResetActive = v;
         postInvalidateOnAnimation();
     }
 
@@ -136,83 +142,75 @@ public final class TrackingBarsView extends View {
 
         if (w <= 0f || h <= 0f) return;
 
-        final float sectionGap = 10f * density;
-        final float labelH = textPaint.getTextSize() + (6f * density);
-        final float barH = Math.max(10f * density, (h - sectionGap - 2f * labelH) / 2f);
-        final float barRadius = 6f * density;
-
-        float y = padT;
-
-        // --- Radial ---
-        int radialColor = getDistanceColor(distance);
-        String radialLabel = "Radial: " + distance + "px";
-        canvas.drawText(radialLabel, padL, y + textPaint.getTextSize(), textPaint);
-        y += labelH;
-
-        barRect.set(padL, y, padL + w, y + barH);
-        canvas.drawRoundRect(barRect, barRadius, barRadius, bgPaint);
-        canvas.drawRoundRect(barRect, barRadius, barRadius, borderPaint);
-
-        int d = Math.min(distance, Trial32Tracker.DISTANCE_THRESHOLD);
-        float fillW = (Trial32Tracker.DISTANCE_THRESHOLD > 0)
-            ? (w * ((float) d / (float) Trial32Tracker.DISTANCE_THRESHOLD))
-            : 0f;
-
-        if (fillW > 0f) {
-            fillPaint.setColor(radialColor);
-            RectF fill = new RectF(padL, y, padL + fillW, y + barH);
-            canvas.drawRoundRect(fill, barRadius, barRadius, fillPaint);
-        }
-
-        y += barH + sectionGap;
-
-        // --- Axial (Z) ---
+        // Draw a single status circle that reflects radial+axial combined status.
+        // Compute axial display value (keeps existing animation code)
         long now = SystemClock.uptimeMillis();
         display_scale_est = getAnimatedScale(now);
-        String axialLabel = String.format("Axial (Z): %.2fx", display_scale_est);
-        canvas.drawText(axialLabel, padL, y + textPaint.getTextSize(), textPaint);
-        y += labelH;
 
-        barRect.set(padL, y, padL + w, y + barH);
-        canvas.drawRoundRect(barRect, barRadius, barRadius, bgPaint);
-        canvas.drawRoundRect(barRect, barRadius, barRadius, borderPaint);
+        // Determine radial severity: 0=green,1=amber,2=red
+        int radialSeverity;
+        {
+            int radialColor = getDistanceColor(distance);
+            if (radialColor == Color.rgb(0, 255, 0)) radialSeverity = 0;
+            else if (radialColor == Color.rgb(255, 0, 0)) radialSeverity = 2;
+            else radialSeverity = 1; // amber
+        }
 
+        // Determine axial severity similarly
+        int axialSeverity;
+        {
+            double ratio;
+            if (display_scale_est >= 1.0) {
+                double max_dev = Math.max(Trial32Tracker.SCALE_MAX - 1.0, 1e-6);
+                double dev = Math.min(display_scale_est - 1.0, Trial32Tracker.SCALE_MAX - 1.0);
+                ratio = clamp01(dev / max_dev);
+            } else {
+                double max_dev = Math.max(1.0 - Trial32Tracker.SCALE_MIN, 1e-6);
+                double dev = Math.min(1.0 - display_scale_est, 1.0 - Trial32Tracker.SCALE_MIN);
+                ratio = clamp01(dev / max_dev);
+            }
+            if (ratio < 0.5) axialSeverity = 0;
+            else if (ratio < 0.8) axialSeverity = 1;
+            else axialSeverity = 2;
+        }
+
+        int combinedSeverity = Math.max(radialSeverity, axialSeverity);
+
+        // Colors: green, amber, red, grey(transparent)
+        int green = Color.rgb(0, 255, 0);
+        int amber = Color.rgb(255, 191, 0);
+        int red = Color.rgb(255, 0, 0);
+        int greyTrans = Color.argb(140, 128, 128, 128);
+
+        // Circle layout
         float cx = padL + w / 2f;
-        canvas.drawLine(cx, y, cx, y + barH, centerLinePaint);
+        float cy = padT + h / 2f;
+        float radius = Math.min(w, h) * 0.25f;
 
-        // Mirror Python axial fill calculation (but rendered horizontally).
-        double ratio;
-        boolean right;
-        if (display_scale_est >= 1.0) {
-            double max_dev = Math.max(Trial32Tracker.SCALE_MAX - 1.0, 1e-6);
-            double dev = Math.min(display_scale_est - 1.0, Trial32Tracker.SCALE_MAX - 1.0);
-            ratio = clamp01(dev / max_dev);
-            right = true;
+        int fillColor;
+        // If auto-reset active, force red
+        if (autoResetActive) {
+            fillColor = red;
         } else {
-            double max_dev = Math.max(1.0 - Trial32Tracker.SCALE_MIN, 1e-6);
-            double dev = Math.min(1.0 - display_scale_est, 1.0 - Trial32Tracker.SCALE_MIN);
-            ratio = clamp01(dev / max_dev);
-            right = false;
+            // If tracking inactive (distance==0 and scale==1 and not set), show grey transparent
+            boolean trackingActive = !(distance == 0 && Math.abs(display_scale_est - 1.0) < 1e-9);
+            if (!trackingActive) {
+                fillColor = greyTrans;
+            } else {
+                if (combinedSeverity == 0) fillColor = green;
+                else if (combinedSeverity == 1) fillColor = amber;
+                else fillColor = red;
+            }
         }
 
-        int axialColor;
-        if (ratio < 0.5) {
-            axialColor = Color.rgb(0, 255, 0);
-        } else if (ratio < 0.8) {
-            axialColor = Color.rgb(255, 255, 0);
-        } else {
-            axialColor = Color.rgb(255, 0, 0);
-        }
+        fillPaint.setColor(fillColor);
+        fillPaint.setStyle(Paint.Style.FILL);
+        canvas.drawCircle(cx, cy, radius, fillPaint);
 
-        float halfW = w / 2f;
-        float devW = (float) (ratio * halfW);
-        if (devW > 0f) {
-            fillPaint.setColor(axialColor);
-            RectF fill = right
-                ? new RectF(cx, y, cx + devW, y + barH)
-                : new RectF(cx - devW, y, cx, y + barH);
-            canvas.drawRoundRect(fill, barRadius, barRadius, fillPaint);
-        }
+        // Draw border
+        borderPaint.setStyle(Paint.Style.STROKE);
+        borderPaint.setStrokeWidth(2f * density);
+        canvas.drawCircle(cx, cy, radius, borderPaint);
 
         if (scale_anim_start_ms > 0L) {
             postInvalidateOnAnimation();

@@ -3,8 +3,7 @@ package com.example.uvcviewer;
 import android.content.Context;
 import android.graphics.Canvas;
 import android.graphics.Color;
-import android.graphics.Paint;
-import android.graphics.Path;
+// removed unused Paint and Path imports
 import android.util.AttributeSet;
 import android.view.View;
 
@@ -15,9 +14,7 @@ import androidx.annotation.Nullable;
  * on top of the live camera preview.
  */
 public final class TrackingOverlayView extends View {
-    private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint overlayPaint = new Paint();
-    private final Path arrowHeadPath = new Path();
+    // overlay drawing disabled; keep only state fields
 
     private int[] ref_center = null;
     private int[] live_pt = null;
@@ -40,9 +37,7 @@ public final class TrackingOverlayView extends View {
     }
 
     private void init() {
-        paint.setStyle(Paint.Style.FILL);
-        overlayPaint.setStyle(Paint.Style.FILL);
-        overlayPaint.setColor(Color.argb((int) (0.4f * 255f), 255, 0, 0)); // match Python addWeighted(red, 0.4, ...)
+        // No overlay drawing required; keep view ready for invalidation
         setWillNotDraw(false);
     }
 
@@ -77,39 +72,6 @@ public final class TrackingOverlayView extends View {
         return Color.rgb(255, 0, 0);
     }
 
-    private void drawArrowHead(Canvas canvas, float x0, float y0, float x1, float y1, Paint strokePaint, float tipLengthFraction) {
-        float dx = x1 - x0;
-        float dy = y1 - y0;
-        float len = (float) Math.sqrt(dx * dx + dy * dy);
-        if (len < 1e-3f) return;
-
-        float ux = dx / len;
-        float uy = dy / len;
-
-        float tipLen = tipLengthFraction * len;
-        float angle = (float) (Math.PI / 6.0); // 30 degrees
-
-        float sin = (float) Math.sin(angle);
-        float cos = (float) Math.cos(angle);
-
-        // Rotate unit vector by +angle and -angle, then scale to tipLen (pointing backwards from tip).
-        float rx1 = (ux * cos - uy * sin);
-        float ry1 = (ux * sin + uy * cos);
-        float rx2 = (ux * cos + uy * sin);
-        float ry2 = (-ux * sin + uy * cos);
-
-        float hx1 = x1 - rx1 * tipLen;
-        float hy1 = y1 - ry1 * tipLen;
-        float hx2 = x1 - rx2 * tipLen;
-        float hy2 = y1 - ry2 * tipLen;
-
-        arrowHeadPath.reset();
-        arrowHeadPath.moveTo(x1, y1);
-        arrowHeadPath.lineTo(hx1, hy1);
-        arrowHeadPath.moveTo(x1, y1);
-        arrowHeadPath.lineTo(hx2, hy2);
-
-        canvas.drawPath(arrowHeadPath, strokePaint);
-    }
+    // drawArrowHead removed; overlay drawing disabled
 }
 
