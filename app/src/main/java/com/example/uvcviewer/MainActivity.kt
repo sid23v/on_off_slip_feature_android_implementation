@@ -8,7 +8,9 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
+import android.os.SystemClock
 import android.text.format.Formatter
+import android.util.Log
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -29,6 +31,11 @@ import java.io.File
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.util.Locale
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.AtomicLong
 import org.opencv.android.OpenCVLoader
 import org.opencv.core.CvType
 import org.opencv.core.Mat
@@ -79,6 +86,22 @@ class MainActivity : AppCompatActivity() {
 
     private var yPlane: ByteArray = ByteArray(0)
     private var grayRawMat: Mat? = null
+
+    private val latestGrayFrame = AtomicReference<FrameItem?>(null)
+    private val frameProcessing = AtomicBoolean(false)
+    private val frameProcessor: ExecutorService = Executors.newSingleThreadExecutor()
+
+    private data class FrameItem(val gray: Mat, val timestampNs: Long)
+
+    // Age-based skip threshold (ms): frames older than this will be discarded instead of processed.
+    private val FRAME_AGE_THRESHOLD_MS = 150L
+
+    // Lightweight processing metrics (atomic so worker thread updates safely)
+    private val procCount = AtomicLong(0)
+    private val totalProcNs = AtomicLong(0)
+    private val maxProcNs = AtomicLong(0)
+    private val skipCount = AtomicLong(0)
+    private val lastMetricsLogNs = AtomicLong(0)
     // Auto-reset dialog and state
     private var autoResetDialog: AlertDialog? = null
     private val autoResetHandler = Handler(Looper.getMainLooper())
@@ -209,6 +232,7 @@ class MainActivity : AppCompatActivity() {
             usbMonitor.destroy()
         }
         cameraThread.quitSafely()
+        frameProcessor.shutdownNow()
 
         grayRawMat?.release()
         grayRawMat = null
@@ -550,7 +574,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private var trackingFrameCounter = 0
     private var lastTrackingState: Trial32Tracker.FrameState? = null
     private val frameCallback = IFrameCallback { frame: ByteBuffer ->
         // Update FPS
@@ -580,63 +603,107 @@ class MainActivity : AppCompatActivity() {
         }
         frame.get(yPlane, 0, ySize)
 
-        val grayRaw = grayRawMat?.let { existing ->
-            if (existing.rows() == h && existing.cols() == w && existing.type() == CvType.CV_8UC1) {
-                existing
-            } else {
-                existing.release()
-                Mat(h, w, CvType.CV_8UC1).also { grayRawMat = it }
-            }
-        } ?: Mat(h, w, CvType.CV_8UC1).also { grayRawMat = it }
+        // Create a fresh Mat for this frame to avoid an extra clone and reduce latency.
+        val frameMat = Mat(h, w, CvType.CV_8UC1)
+        frameMat.put(0, 0, yPlane)
 
-        grayRaw.put(0, 0, yPlane)
+        // Latest-frame-wins: keep only the newest queued frame for processing.
+        val newFrame = FrameItem(frameMat, SystemClock.elapsedRealtimeNanos())
+        val oldFrame = latestGrayFrame.getAndSet(newFrame)
+        oldFrame?.gray?.release()
 
-        // Relay every frame, but only process every alternate frame for tracking
-        trackingFrameCounter = (trackingFrameCounter + 1) % 2
-        if (trackingFrameCounter == 0) {
-            val state = synchronized(trackerLock) {
-                t.process(grayRaw)
-            }
-            lastTrackingState = state
+        if (frameProcessing.compareAndSet(false, true)) {
+            processLatestFrame()
         }
-        // Always relay the last tracking state (may be from previous frame)
-        val stateToRelay = lastTrackingState
-        if (stateToRelay != null) {
-            runOnUiThread {
-                overlayView.setFrameState(stateToRelay)
-                barsView.setFrameState(stateToRelay)
-                stateToRelay.status_message?.let { statusText.text = it }
+    }
 
-                // If auto-reset triggered, show a non-cancellable popup for 10s or until Set Reference is clicked.
-                val msg = stateToRelay.status_message
-                if (msg != null && msg.contains("Auto-reset")) {
-                    // show dialog if not already shown
-                    if (autoResetDialog == null) {
-                        barsView.setAutoResetActive(true)
-                        val builder = AlertDialog.Builder(this@MainActivity)
-                        builder.setTitle("Auto-reset")
-                        builder.setMessage(msg)
-                        builder.setCancelable(false)
-                        builder.setPositiveButton("OK") { dlg, _ ->
-                            dlg.dismiss()
-                            barsView.setAutoResetActive(false)
-                            autoResetDialog = null
-                            autoResetDismissRunnable?.let { autoResetHandler.removeCallbacks(it) }
-                            autoResetDismissRunnable = null
-                        }
-                        val dlg = builder.create()
-                        autoResetDialog = dlg
-                        dlg.show()
+    private fun processLatestFrame() {
+        frameProcessor.execute {
+            try {
+                while (true) {
+                    val item = latestGrayFrame.getAndSet(null) ?: break
+                    val nowNs = SystemClock.elapsedRealtimeNanos()
+                    val ageMs = (nowNs - item.timestampNs) / 1_000_000
+                    Log.d("Tracker", "frame age ms=$ageMs")
 
-                        // Dismiss after 10s if still present
-                        autoResetDismissRunnable = Runnable {
-                            autoResetDialog?.dismiss()
-                            autoResetDialog = null
-                            barsView.setAutoResetActive(false)
-                            autoResetDismissRunnable = null
-                        }
-                        autoResetHandler.postDelayed(autoResetDismissRunnable!!, 10000L)
+                    // Skip frames that are too old to be useful.
+                    if (ageMs > FRAME_AGE_THRESHOLD_MS) {
+                        skipCount.incrementAndGet()
+                        item.gray.release()
+                        continue
                     }
+
+                    val t0 = SystemClock.elapsedRealtimeNanos()
+                    val state = synchronized(trackerLock) {
+                        tracker?.process(item.gray)
+                    }
+                    val dt = SystemClock.elapsedRealtimeNanos() - t0
+                    procCount.incrementAndGet()
+                    totalProcNs.addAndGet(dt)
+                    // update max
+                    while (true) {
+                        val curMax = maxProcNs.get()
+                        if (dt <= curMax || maxProcNs.compareAndSet(curMax, dt)) break
+                    }
+
+                    item.gray.release()
+
+                    state?.let { frameState ->
+                        lastTrackingState = frameState
+                        runOnUiThread {
+                            overlayView.setFrameState(frameState)
+                            barsView.setFrameState(frameState)
+                            frameState.status_message?.let { statusText.text = it }
+
+                            val msg = frameState.status_message
+                            if (msg != null && msg.contains("Auto-reset")) {
+                                if (autoResetDialog == null) {
+                                    barsView.setAutoResetActive(true)
+                                    val builder = AlertDialog.Builder(this@MainActivity)
+                                    builder.setTitle("Auto-reset")
+                                    builder.setMessage(msg)
+                                    builder.setCancelable(false)
+                                    builder.setPositiveButton("OK") { dlg, _ ->
+                                        dlg.dismiss()
+                                        barsView.setAutoResetActive(false)
+                                        autoResetDialog = null
+                                        autoResetDismissRunnable?.let { autoResetHandler.removeCallbacks(it) }
+                                        autoResetDismissRunnable = null
+                                    }
+                                    val dlg = builder.create()
+                                    autoResetDialog = dlg
+                                    dlg.show()
+
+                                    autoResetDismissRunnable = Runnable {
+                                        autoResetDialog?.dismiss()
+                                        autoResetDialog = null
+                                        barsView.setAutoResetActive(false)
+                                        autoResetDismissRunnable = null
+                                    }
+                                    autoResetHandler.postDelayed(autoResetDismissRunnable!!, 10000L)
+                                }
+                            }
+                        }
+                    }
+
+                    // Periodically log metrics (roughly every second)
+                    val lastLog = lastMetricsLogNs.get()
+                    if (nowNs - lastLog > 1_000_000_000L && lastMetricsLogNs.compareAndSet(lastLog, nowNs)) {
+                        val count = procCount.getAndSet(0)
+                        val totalNs = totalProcNs.getAndSet(0)
+                        val maxNs = maxProcNs.getAndSet(0)
+                        val skips = skipCount.getAndSet(0)
+                        if (count > 0 || skips > 0) {
+                            val avgMs = if (count > 0) (totalNs.toDouble() / count.toDouble()) / 1_000_000.0 else 0.0
+                            val maxMs = if (maxNs > 0) maxNs.toDouble() / 1_000_000.0 else 0.0
+                            Log.d("Tracker", "proc frames=$count avg_ms=${String.format(Locale.US, "%.2f", avgMs)} max_ms=${String.format(Locale.US, "%.2f", maxMs)} skips=$skips")
+                        }
+                    }
+                }
+            } finally {
+                frameProcessing.set(false)
+                if (latestGrayFrame.get() != null && frameProcessing.compareAndSet(false, true)) {
+                    processLatestFrame()
                 }
             }
         }
