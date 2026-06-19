@@ -46,6 +46,7 @@ public final class Trial32Tracker {
     public static final int SCALE_OUTLIER_FRAMES = 3;
     public static final int DISTANCE_CONFIRM_FRAMES = 2;
     public static final double DISTANCE_FAST_FACTOR = 1.4;
+    public static final double DISTANCE_HUGE_RESET_FACTOR = 1.65;
     public static final double JUMP_FAST_FACTOR = 1.1;
 
     public int overlay_counter = 0;
@@ -101,6 +102,9 @@ public final class Trial32Tracker {
     public static final int CONSENSUS_MIN_METHODS_POOR = 1;
     public static final int LOST_FRAMES_MAX_POOR = 6;
 
+    // Temporal preference for continuity across frames.
+    public static final double TEMPORAL_PREFERENCE_WEIGHT = 0.25;
+
     // Optical flow quality threshold
     public static final double FLOW_ERR_MAX = 12.0;
 
@@ -126,6 +130,8 @@ public final class Trial32Tracker {
     public int last_distance = 0;
     public int scale_outlier_counter = 0;
     public int distance_exceed_counter = 0;
+    private ActiveFrameSnapshot first_active_snapshot = null;
+    private ActiveFrameSnapshot last_active_snapshot = null;
 
     // ======= feature-rich gating variables & thresholds =======
     public boolean was_feature_rich = false; // True only when a valid (feature-rich) reference was set
@@ -153,6 +159,18 @@ public final class Trial32Tracker {
             this.last_scale_est = last_scale_est;
             this.overlay_counter = overlay_counter;
             this.status_message = status_message;
+        }
+    }
+
+    private static final class ActiveFrameSnapshot {
+        final int[] live_pt;
+        final int distance;
+        final double scale;
+
+        ActiveFrameSnapshot(int[] live_pt, int distance, double scale) {
+            this.live_pt = new int[] { live_pt[0], live_pt[1] };
+            this.distance = distance;
+            this.scale = scale;
         }
     }
 
@@ -292,6 +310,7 @@ public final class Trial32Tracker {
         last_distance = 0;
         scale_outlier_counter = 0;
         distance_exceed_counter = 0;
+        clear_active_snapshots();
 
         last_status_message = reason;
     }
@@ -312,6 +331,71 @@ public final class Trial32Tracker {
 
     private static boolean is_near_center(int distance) {
         return distance <= CENTER_GUARD_RADIUS;
+    }
+
+    private void clear_active_snapshots() {
+        first_active_snapshot = null;
+        last_active_snapshot = null;
+    }
+
+    private void remember_active_snapshot(int[] current_live_pt, int current_distance) {
+        if (current_live_pt == null) {
+            return;
+        }
+        ActiveFrameSnapshot snapshot = new ActiveFrameSnapshot(current_live_pt, current_distance, last_scale_est);
+        if (first_active_snapshot == null) {
+            first_active_snapshot = snapshot;
+        }
+        last_active_snapshot = snapshot;
+    }
+
+    private void ensure_active_snapshot_started() {
+        if (first_active_snapshot == null && live_pt != null) {
+            remember_active_snapshot(live_pt, last_distance);
+        }
+    }
+
+    private boolean should_reset_for_abrupt_tracking_loss(int skipped_input_frames) {
+        if (skipped_input_frames <= 0 || first_active_snapshot == null || last_active_snapshot == null) {
+            return false;
+        }
+        return last_active_snapshot.distance <= DISTANCE_THRESHOLD;
+    }
+
+    private boolean should_reset_for_abrupt_state_change(int[] current_live_pt, int current_distance, int skipped_input_frames) {
+        if (current_live_pt == null ||
+            first_active_snapshot == null || last_active_snapshot == null) {
+            return false;
+        }
+
+        boolean current_outside = current_distance > DISTANCE_THRESHOLD;
+        boolean first_was_inside = first_active_snapshot.distance <= DISTANCE_THRESHOLD;
+        boolean last_was_inside = last_active_snapshot.distance <= DISTANCE_THRESHOLD;
+        double jump_from_last = pt_distance(current_live_pt, last_active_snapshot.live_pt);
+        double jump_from_first = pt_distance(current_live_pt, first_active_snapshot.live_pt);
+
+        // Enhanced detection: trigger reset even without skipped frames if jump is extremely large
+        // This handles fast movements that happen within a single frame processing cycle
+        if (current_outside && last_was_inside &&
+            jump_from_last >= (double) DISTANCE_THRESHOLD * JUMP_FAST_FACTOR) {
+            return true;
+        }
+
+        if (current_outside && first_was_inside && last_was_inside &&
+            jump_from_first >= (double) DISTANCE_THRESHOLD * DISTANCE_FAST_FACTOR) {
+            return true;
+        }
+
+        // Additional check: if we skipped frames and the jump is significant, reset immediately
+        if (skipped_input_frames > 0 && current_outside && last_was_inside &&
+            jump_from_last >= (double) DISTANCE_THRESHOLD * 0.8) {
+            return true;
+        }
+
+        boolean current_scale_outside = last_scale_est < SCALE_MIN || last_scale_est > SCALE_MAX;
+        boolean first_scale_inside = SCALE_MIN <= first_active_snapshot.scale && first_active_snapshot.scale <= SCALE_MAX;
+        boolean last_scale_inside = SCALE_MIN <= last_active_snapshot.scale && last_active_snapshot.scale <= SCALE_MAX;
+        return current_scale_outside && first_scale_inside && last_scale_inside;
     }
 
     private static double compute_entropy(Mat gray) {
@@ -598,7 +682,8 @@ public final class Trial32Tracker {
         double confidence_min,
         double confidence_strong,
         int consensus_dist,
-        int consensus_min_methods
+        int consensus_min_methods,
+        int[] prev_live_pt
     ) {
         if (candidates == null || candidates.isEmpty()) {
             return new ConsensusResult(null, 0.0, Collections.emptyList());
@@ -645,6 +730,13 @@ public final class Trial32Tracker {
             double score = 0.0;
             for (Candidate g : group) {
                 score += g.conf;
+                if (prev_live_pt != null) {
+                    double prevDist = pt_distance(g.pt, prev_live_pt);
+                    double temporalBoost = ((consensus_dist - prevDist) / consensus_dist) * TEMPORAL_PREFERENCE_WEIGHT;
+                    if (temporalBoost > 0.0) {
+                        score += temporalBoost;
+                    }
+                }
             }
             if (group.size() > best_group.size() || (group.size() == best_group.size() && score > best_score)) {
                 best_group = group;
@@ -743,6 +835,8 @@ public final class Trial32Tracker {
         last_distance = 0;
         scale_outlier_counter = 0;
         distance_exceed_counter = 0;
+        clear_active_snapshots();
+        remember_active_snapshot(live_pt, last_distance);
 
         if (was_feature_rich) {
             last_status_message = "Reference set (feature-rich). Tracking enabled.";
@@ -759,6 +853,26 @@ public final class Trial32Tracker {
      * @param gray_raw input grayscale frame (any size); internally resized to {@link #FRAME_WIDTH}x{@link #FRAME_HEIGHT}
      */
     public FrameState process(Mat gray_raw) {
+        return process(gray_raw, 0);
+    }
+
+    /**
+     * Process one frame.
+     *
+     * @param gray_raw input grayscale frame (any size); internally resized to {@link #FRAME_WIDTH}x{@link #FRAME_HEIGHT}
+     * @param input_frame_dropped true when the capture queue replaced at least one unprocessed frame before this frame
+     */
+    public FrameState process(Mat gray_raw, boolean input_frame_dropped) {
+        return process(gray_raw, input_frame_dropped ? 1 : 0);
+    }
+
+    /**
+     * Process one frame.
+     *
+     * @param gray_raw input grayscale frame (any size); internally resized to {@link #FRAME_WIDTH}x{@link #FRAME_HEIGHT}
+     * @param skipped_input_frames number of captured frames skipped since the last tracker-processed frame
+     */
+    public FrameState process(Mat gray_raw, int skipped_input_frames) {
         last_status_message = null;
 
         // Mirror: frame = resize -> gray_raw = BGR2GRAY -> clahe.apply
@@ -772,6 +886,7 @@ public final class Trial32Tracker {
         int distance = 0;
 
         if (reference_frame != null) {
+            ensure_active_snapshot_started();
             orb.detectAndCompute(gray, new Mat(), kp_m, desc);
             KeyPoint[] kp = kp_m.toArray();
 
@@ -783,7 +898,8 @@ public final class Trial32Tracker {
             }
 
             boolean tracking_feature_rich = was_feature_rich && curr_feature_rich;
-            boolean near_center = is_near_center(last_distance);
+            boolean input_frame_dropped = skipped_input_frames > 0;
+            boolean near_center = !input_frame_dropped && is_near_center(last_distance);
 
             if (tracking_feature_rich) {
                 if (kp != null && kp.length < MIN_KP_CURRENT) {
@@ -991,24 +1107,38 @@ public final class Trial32Tracker {
                 confidence_min,
                 confidence_strong,
                 CONSENSUS_DIST,
-                consensus_min_methods
+                consensus_min_methods,
+                prev_live_pt
             );
 
             if (consensus.pt == null) {
                 distance_exceed_counter = 0;
                 Candidate fast_far = null;
-                if (!candidates.isEmpty()) {
-                    for (Candidate c : candidates) {
-                        if (c.conf >= confidence_strong) {
-                            if (pt_distance(c.pt, ref_center) >= (double) DISTANCE_THRESHOLD * DISTANCE_FAST_FACTOR) {
-                                fast_far = c;
-                                break;
-                            }
-                        }
+                Candidate huge_far = null;
+                for (Candidate c : candidates) {
+                    double candidate_distance = pt_distance(c.pt, ref_center);
+                    if (fast_far == null && c.conf >= confidence_strong &&
+                        candidate_distance >= (double) DISTANCE_THRESHOLD * DISTANCE_FAST_FACTOR) {
+                        fast_far = c;
+                    }
+                    if (huge_far == null && c.conf >= confidence_min &&
+                        candidate_distance >= (double) DISTANCE_THRESHOLD * DISTANCE_HUGE_RESET_FACTOR) {
+                        huge_far = c;
+                    }
+                    if (fast_far != null && huge_far != null) {
+                        break;
                     }
                 }
-                if (fast_far != null) {
-                    reset_tracking("Auto-reset (large sudden movement)");
+
+                if (fast_far != null || huge_far != null) {
+                    reset_tracking("Auto-reset (huge movement)");
+                    kp_m.release();
+                    desc.release();
+                    return new FrameState(ref_center, live_pt, 0, last_scale_est, overlay_counter, last_status_message);
+                }
+
+                if (should_reset_for_abrupt_tracking_loss(skipped_input_frames)) {
+                    reset_tracking("Auto-reset (abrupt skipped-frame tracking loss)");
                     kp_m.release();
                     desc.release();
                     return new FrameState(ref_center, live_pt, 0, last_scale_est, overlay_counter, last_status_message);
@@ -1042,7 +1172,20 @@ public final class Trial32Tracker {
                 boolean fast_distance = distance >= (double) DISTANCE_THRESHOLD * DISTANCE_FAST_FACTOR;
                 boolean fast_jump = jump_dist >= (double) DISTANCE_THRESHOLD * JUMP_FAST_FACTOR && consensus.conf >= confidence_strong;
 
+                if (should_reset_for_abrupt_state_change(live_pt, distance, skipped_input_frames)) {
+                    reset_tracking("Auto-reset (abrupt skipped-frame movement)");
+                    kp_m.release();
+                    desc.release();
+                    return new FrameState(ref_center, live_pt, 0, last_scale_est, overlay_counter, last_status_message);
+                }
+
                 if (distance > DISTANCE_THRESHOLD) {
+                    if (distance >= (double) DISTANCE_THRESHOLD * DISTANCE_HUGE_RESET_FACTOR) {
+                        reset_tracking("Auto-reset (huge movement)");
+                        kp_m.release();
+                        desc.release();
+                        return new FrameState(ref_center, live_pt, 0, last_scale_est, overlay_counter, last_status_message);
+                    }
                     if (fast_distance || fast_jump) {
                         reset_tracking("Auto-reset (large sudden movement)");
                         kp_m.release();
@@ -1051,6 +1194,9 @@ public final class Trial32Tracker {
                     }
 
                     int distance_limit = DISTANCE_CONFIRM_FRAMES + (near_center ? CENTER_GRACE_FRAMES : 0);
+                    if (distance >= (double) DISTANCE_THRESHOLD * 1.15) {
+                        distance_limit = 1;
+                    }
                     distance_exceed_counter += 1;
                     if (distance_exceed_counter >= distance_limit) {
                         reset_tracking("Auto-reset (distance threshold)");
@@ -1061,6 +1207,8 @@ public final class Trial32Tracker {
                 } else {
                     distance_exceed_counter = 0;
                 }
+
+                remember_active_snapshot(live_pt, distance);
             }
         }
 

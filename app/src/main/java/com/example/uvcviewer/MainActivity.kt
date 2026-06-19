@@ -90,8 +90,16 @@ class MainActivity : AppCompatActivity() {
     private val latestGrayFrame = AtomicReference<FrameItem?>(null)
     private val frameProcessing = AtomicBoolean(false)
     private val frameProcessor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val capturedFrameSeq = AtomicLong(0)
+    private val lastProcessedFrameSeq = AtomicLong(0)
+    private val latestUiFrameSeq = AtomicLong(0)
 
-    private data class FrameItem(val gray: Mat, val timestampNs: Long)
+    private data class FrameItem(
+        val gray: Mat,
+        val timestampNs: Long,
+        val sequence: Long,
+        val droppedFrames: Int,
+    )
 
     // Age-based skip threshold (ms): frames older than this will be discarded instead of processed.
     private val FRAME_AGE_THRESHOLD_MS = 150L
@@ -585,7 +593,7 @@ class MainActivity : AppCompatActivity() {
             lastFpsTime = currentTime
         }
 
-        val t = tracker ?: return@IFrameCallback
+        if (tracker == null) return@IFrameCallback
         if (!openCvOk) return@IFrameCallback
 
         val w = previewWidth
@@ -607,10 +615,21 @@ class MainActivity : AppCompatActivity() {
         val frameMat = Mat(h, w, CvType.CV_8UC1)
         frameMat.put(0, 0, yPlane)
 
-        // Latest-frame-wins: keep only the newest queued frame for processing.
-        val newFrame = FrameItem(frameMat, SystemClock.elapsedRealtimeNanos())
-        val oldFrame = latestGrayFrame.getAndSet(newFrame)
-        oldFrame?.gray?.release()
+        // Latest-frame-wins: keep only the newest queued frame for processing,
+        // while preserving whether queued frames were replaced before processing.
+        val sequence = capturedFrameSeq.incrementAndGet()
+        val timestampNs = SystemClock.elapsedRealtimeNanos()
+        var replacedFrame: FrameItem?
+        while (true) {
+            val currentQueuedFrame = latestGrayFrame.get()
+            val droppedFrames = if (currentQueuedFrame == null) 0 else currentQueuedFrame.droppedFrames + 1
+            val newFrame = FrameItem(frameMat, timestampNs, sequence, droppedFrames)
+            if (latestGrayFrame.compareAndSet(currentQueuedFrame, newFrame)) {
+                replacedFrame = currentQueuedFrame
+                break
+            }
+        }
+        replacedFrame?.gray?.release()
 
         if (frameProcessing.compareAndSet(false, true)) {
             processLatestFrame()
@@ -633,10 +652,18 @@ class MainActivity : AppCompatActivity() {
                         continue
                     }
 
+                    val previousProcessedSequence = lastProcessedFrameSeq.get()
+                    val skippedSinceLastProcessed = (item.sequence - previousProcessedSequence - 1L)
+                        .coerceAtLeast(0L)
+                        .coerceAtMost(Int.MAX_VALUE.toLong())
+                        .toInt()
+                    val skippedInputFrames = maxOf(item.droppedFrames, skippedSinceLastProcessed)
+
                     val t0 = SystemClock.elapsedRealtimeNanos()
                     val state = synchronized(trackerLock) {
-                        tracker?.process(item.gray)
+                        tracker?.process(item.gray, skippedInputFrames)
                     }
+                    lastProcessedFrameSeq.set(item.sequence)
                     val dt = SystemClock.elapsedRealtimeNanos() - t0
                     procCount.incrementAndGet()
                     totalProcNs.addAndGet(dt)
@@ -650,13 +677,20 @@ class MainActivity : AppCompatActivity() {
 
                     state?.let { frameState ->
                         lastTrackingState = frameState
+                        val stateSequence = item.sequence
+                        latestUiFrameSeq.set(stateSequence)
                         runOnUiThread {
+                            val msg = frameState.status_message
+                            val autoReset = msg != null && msg.contains("Auto-reset")
+                            if (!autoReset && stateSequence < latestUiFrameSeq.get()) {
+                                return@runOnUiThread
+                            }
+
                             overlayView.setFrameState(frameState)
                             barsView.setFrameState(frameState)
-                            frameState.status_message?.let { statusText.text = it }
+                            msg?.let { statusText.text = it }
 
-                            val msg = frameState.status_message
-                            if (msg != null && msg.contains("Auto-reset")) {
+                            if (autoReset) {
                                 if (autoResetDialog == null) {
                                     barsView.setAutoResetActive(true)
                                     val builder = AlertDialog.Builder(this@MainActivity)
@@ -698,6 +732,13 @@ class MainActivity : AppCompatActivity() {
                             val maxMs = if (maxNs > 0) maxNs.toDouble() / 1_000_000.0 else 0.0
                             Log.d("Tracker", "proc frames=$count avg_ms=${String.format(Locale.US, "%.2f", avgMs)} max_ms=${String.format(Locale.US, "%.2f", maxMs)} skips=$skips")
                         }
+                    }
+
+                    // After processing one frame, check if there's a newer frame available
+                    // If yes, continue the loop to process it immediately (latest-frame-wins)
+                    // If no, break the loop to wait for the next frame callback
+                    if (latestGrayFrame.get() == null) {
+                        break
                     }
                 }
             } finally {
