@@ -77,6 +77,7 @@ class MainActivity : AppCompatActivity() {
     private val perfUpdateRunnable = object : Runnable {
         override fun run() {
             updatePerformanceMetrics()
+            logConsolidatedMetrics()
             perfHandler.postDelayed(this, 1000)
         }
     }
@@ -93,6 +94,12 @@ class MainActivity : AppCompatActivity() {
     private val capturedFrameSeq = AtomicLong(0)
     private val lastProcessedFrameSeq = AtomicLong(0)
     private val latestUiFrameSeq = AtomicLong(0)
+
+    // Camera and tracking state for logging
+    private var isCameraConnected = false
+    private var wasTrackingActive = false
+    private var lastResetReason: String? = null
+    private var lastResetTimestamp: Long = 0
 
     private data class FrameItem(
         val gray: Mat,
@@ -200,6 +207,9 @@ class MainActivity : AppCompatActivity() {
                 t.resetTrackingManual()
             }
             t.last_status_message?.let { setStatus(it) }
+            // Record manual reset for logging
+            lastResetReason = "Manual reset"
+            lastResetTimestamp = System.currentTimeMillis()
         }
 
         quitButton.setOnClickListener {
@@ -359,6 +369,7 @@ class MainActivity : AppCompatActivity() {
                     uvcCamera = camera
                     isActive = true
                     isPreview = false
+                    isCameraConnected = true
                 }
 
                 val surface = previewSurface
@@ -390,6 +401,7 @@ class MainActivity : AppCompatActivity() {
                 uvcCamera = null
                 isActive = false
                 isPreview = false
+                isCameraConnected = false
                 try {
                     camera?.setFrameCallback(null, 0)
                 } catch (_: Throwable) {
@@ -587,6 +599,109 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun logConsolidatedMetrics() {
+        val t = tracker ?: return
+        
+        // 1. Camera connection state
+        val cameraState = if (isCameraConnected) "Connected" else "Disconnected"
+        
+        // 2. Tracker state
+        val isTrackingActive = synchronized(trackerLock) {
+            t.reference_frame != null
+        }
+        val trackerState = if (isTrackingActive) "Active" else "Inactive"
+        
+        // 3. Camera frame rate
+        val cameraFps = if (isCameraConnected) String.format(Locale.US, "%.1f", currentFps) else "0.0"
+        
+        // 4. Queue size
+        val queueSize = if (isCameraConnected && isTrackingActive) {
+            if (latestGrayFrame.get() != null) 1 else 0
+        } else 0
+        
+        // 5. Frames dropped
+        val framesDropped = if (isCameraConnected && isTrackingActive) {
+            droppedFrameCount.getAndSet(0)
+        } else 0
+        
+        // 6. Processing rate
+        val processingFps = if (isCameraConnected && isTrackingActive) {
+            procCount.getAndSet(0)
+        } else 0
+        
+        // 7. Motion parameters
+        val motionParams = if (isCameraConnected && isTrackingActive) {
+            synchronized(trackerLock) {
+                val distance = t.last_distance
+                val scale = t.last_scale_est
+                val lostCounter = t.lost_counter
+                val featureLossCounter = t.feature_loss_counter
+                val lowEntropyCounter = t.low_entropy_counter
+                val distanceExceedCounter = t.distance_exceed_counter
+                val scaleOutlierCounter = t.scale_outlier_counter
+                val wasFeatureRich = t.was_feature_rich
+                
+                "distance_current:${distance};distance_threshold:${Trial32Tracker.DISTANCE_THRESHOLD};" +
+                "scale_current:${String.format(Locale.US, "%.3f", scale)};scale_min:${Trial32Tracker.SCALE_MIN};scale_max:${Trial32Tracker.SCALE_MAX};" +
+                "lost_counter:${lostCounter};lost_frames_max:${if (wasFeatureRich) Trial32Tracker.LOST_FRAMES_MAX else Trial32Tracker.LOST_FRAMES_MAX_POOR};" +
+                "feature_loss_counter:${featureLossCounter};feature_loss_limit:${Trial32Tracker.FEATURE_LOSS_FRAMES + Trial32Tracker.CENTER_GRACE_FRAMES};" +
+                "low_entropy_counter:${lowEntropyCounter};low_entropy_limit:${Trial32Tracker.LOW_ENTROPY_FRAMES + Trial32Tracker.CENTER_GRACE_FRAMES};" +
+                "distance_exceed_counter:${distanceExceedCounter};distance_confirm_frames:${Trial32Tracker.DISTANCE_CONFIRM_FRAMES};" +
+                "scale_outlier_counter:${scaleOutlierCounter};scale_outlier_limit:${Trial32Tracker.SCALE_OUTLIER_FRAMES + Trial32Tracker.CENTER_GRACE_FRAMES}"
+            }
+        } else {
+            "distance_current:0;distance_threshold:${Trial32Tracker.DISTANCE_THRESHOLD};" +
+            "scale_current:1.000;scale_min:${Trial32Tracker.SCALE_MIN};scale_max:${Trial32Tracker.SCALE_MAX};" +
+            "lost_counter:0;lost_frames_max:${Trial32Tracker.LOST_FRAMES_MAX};" +
+            "feature_loss_counter:0;feature_loss_limit:${Trial32Tracker.FEATURE_LOSS_FRAMES + Trial32Tracker.CENTER_GRACE_FRAMES};" +
+            "low_entropy_counter:0;low_entropy_limit:${Trial32Tracker.LOW_ENTROPY_FRAMES + Trial32Tracker.CENTER_GRACE_FRAMES};" +
+            "distance_exceed_counter:0;distance_confirm_frames:${Trial32Tracker.DISTANCE_CONFIRM_FRAMES};" +
+            "scale_outlier_counter:0;scale_outlier_limit:${Trial32Tracker.SCALE_OUTLIER_FRAMES + Trial32Tracker.CENTER_GRACE_FRAMES}"
+        }
+        
+        // 8. Color indicator
+        val colorIndicator = if (isCameraConnected && isTrackingActive) {
+            val distance = synchronized(trackerLock) { t.last_distance }
+            val scale = synchronized(trackerLock) { t.last_scale_est }
+            val ratio = distance.toDouble() / Trial32Tracker.DISTANCE_THRESHOLD
+            val color = when {
+                ratio < 0.5 -> "green"
+                ratio < 0.8 -> "yellow"
+                else -> "red"
+            }
+            color
+        } else {
+            "None"
+        }
+        
+        // 9. Auto-reset status
+        val resetStatus = if (wasTrackingActive && !isTrackingActive) {
+            val now = System.currentTimeMillis()
+            if (now - lastResetTimestamp < 2000) {
+                lastResetReason ?: "Unknown"
+            } else {
+                "None"
+            }
+        } else {
+            "None"
+        }
+        
+        // Update tracking state for next iteration
+        wasTrackingActive = isTrackingActive
+        
+        // Log consolidated metrics
+        Log.d("TrackerLog", "CONSOLIDATED - " +
+            "camera:$cameraState;" +
+            "tracker:$trackerState;" +
+            "camera_fps:$cameraFps;" +
+            "queue_size:$queueSize;" +
+            "frames_dropped:$framesDropped;" +
+            "processing_fps:$processingFps;" +
+            "motion_params:[$motionParams];" +
+            "color:$colorIndicator;" +
+            "reset_status:$resetStatus")
+    }
+
     private var lastTrackingState: Trial32Tracker.FrameState? = null
     private val frameCallback = IFrameCallback { frame: ByteBuffer ->
         // Update FPS
@@ -703,6 +818,14 @@ class MainActivity : AppCompatActivity() {
                         msg?.let { statusText.text = it }
 
                         if (autoReset) {
+                            // Record auto-reset for logging
+                            synchronized(trackerLock) {
+                                tracker?.last_reset_reason?.let { reason ->
+                                    lastResetReason = reason
+                                    lastResetTimestamp = System.currentTimeMillis()
+                                }
+                            }
+                            
                             if (autoResetDialog == null) {
                                 barsView.setAutoResetActive(true)
                                 val builder = AlertDialog.Builder(this@MainActivity)
@@ -755,6 +878,7 @@ class MainActivity : AppCompatActivity() {
                         } else {
                             frameAgeThresholdMs = 150L
                         }
+                        
                         Log.d("Tracker", "proc frames=$count avg_ms=${String.format(Locale.US, "%.2f", avgMs)} max_ms=${String.format(Locale.US, "%.2f", maxMs)} skips=$skips dropped=$dropped threshold=${frameAgeThresholdMs}ms")
                     }
                 }

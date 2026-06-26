@@ -1,5 +1,6 @@
 package com.example.uvcviewer;
 
+import android.util.Log;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -143,6 +144,7 @@ public final class Trial32Tracker {
     private final Mat last_gray_raw = new Mat(); // most recent raw gray (FRAME_WIDTH x FRAME_HEIGHT)
 
     public String last_status_message = null;
+    public String last_reset_reason = null;
 
     public static final class FrameState {
         public final int[] ref_center;
@@ -275,6 +277,8 @@ public final class Trial32Tracker {
     }
 
     public void reset_tracking(String reason) {
+        last_reset_reason = reason;
+        
         if (reference_frame != null) {
             reference_frame.release();
         }
