@@ -78,7 +78,7 @@ class MainActivity : AppCompatActivity() {
         override fun run() {
             updatePerformanceMetrics()
             logConsolidatedMetrics()
-            perfHandler.postDelayed(this, 1000)
+            perfHandler.postDelayed(this, 100)
         }
     }
 
@@ -855,9 +855,9 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
 
-                // Periodically log metrics (roughly every second)
+                // Periodically log metrics (roughly every 100ms)
                 val lastLog = lastMetricsLogNs.get()
-                if (nowNs - lastLog > 1_000_000_000L && lastMetricsLogNs.compareAndSet(lastLog, nowNs)) {
+                if (nowNs - lastLog > 100_000_000L && lastMetricsLogNs.compareAndSet(lastLog, nowNs)) {
                     val count = procCount.getAndSet(0)
                     val totalNs = totalProcNs.getAndSet(0)
                     val maxNs = maxProcNs.getAndSet(0)
